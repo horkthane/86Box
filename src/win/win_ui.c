@@ -8,7 +8,7 @@
  *
  *		user Interface module for WinAPI on Windows.
  *
- * Version:	@(#)win_ui.c	1.0.44	2019/11/02
+ * Version:	@(#)win_ui.c	1.0.45	2019/12/05
  *
  * Authors:	Sarah Walker, <http://pcem-emulator.co.uk/>
  *		Miran Grca, <mgrca8@gmail.com>
@@ -39,7 +39,9 @@
 #include "../plat_midi.h"
 #include "../ui.h"
 #include "win.h"
-#include "win_d3d.h"
+#ifdef USE_DISCORD
+# include "win_discord.h"
+#endif
 
 
 #define TIMER_1SEC	1		/* ID of the one-second timer */
@@ -156,20 +158,13 @@ ResetAllMenus(void)
     CheckMenuItem(menuMain, IDM_VID_INVERT, MF_UNCHECKED);
 
     CheckMenuItem(menuMain, IDM_VID_RESIZE, MF_UNCHECKED);
-    CheckMenuItem(menuMain, IDM_VID_DDRAW+0, MF_UNCHECKED);
+    CheckMenuItem(menuMain, IDM_VID_SDL_SW, MF_UNCHECKED);
+    CheckMenuItem(menuMain, IDM_VID_SDL_HW, MF_UNCHECKED);
 #ifdef USE_D2D
-    CheckMenuItem(menuMain, IDM_VID_DDRAW+1, MF_UNCHECKED);
-    CheckMenuItem(menuMain, IDM_VID_DDRAW+2, MF_UNCHECKED);
-    CheckMenuItem(menuMain, IDM_VID_DDRAW+3, MF_UNCHECKED);
-#ifdef USE_VNC
-    CheckMenuItem(menuMain, IDM_VID_DDRAW+4, MF_UNCHECKED);
+    CheckMenuItem(menuMain, IDM_VID_D2D, MF_UNCHECKED);
 #endif
-#else
-    CheckMenuItem(menuMain, IDM_VID_DDRAW+1, MF_UNCHECKED);
-    CheckMenuItem(menuMain, IDM_VID_DDRAW+2, MF_UNCHECKED);
 #ifdef USE_VNC
-    CheckMenuItem(menuMain, IDM_VID_DDRAW+3, MF_UNCHECKED);
-#endif
+    CheckMenuItem(menuMain, IDM_VID_VNC, MF_UNCHECKED);
 #endif
     CheckMenuItem(menuMain, IDM_VID_FS_FULL+0, MF_UNCHECKED);
     CheckMenuItem(menuMain, IDM_VID_FS_FULL+1, MF_UNCHECKED);
@@ -226,7 +221,7 @@ ResetAllMenus(void)
 
     if (vid_resize)
 	CheckMenuItem(menuMain, IDM_VID_RESIZE, MF_CHECKED);
-    CheckMenuItem(menuMain, IDM_VID_DDRAW+vid_api, MF_CHECKED);
+    CheckMenuItem(menuMain, IDM_VID_SDL_SW+vid_api, MF_CHECKED);
     CheckMenuItem(menuMain, IDM_VID_FS_FULL+video_fullscreen_scale, MF_CHECKED);
     CheckMenuItem(menuMain, IDM_VID_REMEMBER, window_remember?MF_CHECKED:MF_UNCHECKED);
     CheckMenuItem(menuMain, IDM_VID_SCALE_1X+scale, MF_CHECKED);
@@ -234,6 +229,13 @@ ResetAllMenus(void)
     CheckMenuItem(menuMain, IDM_VID_CGACON, vid_cga_contrast?MF_CHECKED:MF_UNCHECKED);
     CheckMenuItem(menuMain, IDM_VID_GRAYCT_601+video_graytype, MF_CHECKED);
     CheckMenuItem(menuMain, IDM_VID_GRAY_RGB+video_grayscale, MF_CHECKED);
+
+#ifdef USE_DISCORD
+    if (discord_loaded)
+	CheckMenuItem(menuMain, IDM_DISCORD, enable_discord ? MF_CHECKED : MF_UNCHECKED);
+    else
+	EnableMenuItem(menuMain, IDM_DISCORD, MF_DISABLED);
+#endif
 }
 
 
@@ -440,18 +442,17 @@ MainWindowProcedure(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 				config_save();
 				break;
 
-			case IDM_VID_DDRAW:
+			case IDM_VID_SDL_SW:
+			case IDM_VID_SDL_HW:
 #ifdef USE_D2D
 			case IDM_VID_D2D:
 #endif
-			case IDM_VID_D3D:
-			case IDM_VID_SDL:
 #ifdef USE_VNC
 			case IDM_VID_VNC:
 #endif
-				CheckMenuItem(hmenu, IDM_VID_DDRAW+vid_api, MF_UNCHECKED);
-				plat_setvid(LOWORD(wParam) - IDM_VID_DDRAW);
-				CheckMenuItem(hmenu, IDM_VID_DDRAW+vid_api, MF_CHECKED);
+				CheckMenuItem(hmenu, IDM_VID_SDL_SW + vid_api, MF_UNCHECKED);
+				plat_setvid(LOWORD(wParam) - IDM_VID_SDL_SW);
+				CheckMenuItem(hmenu, IDM_VID_SDL_SW + vid_api, MF_CHECKED);
 				config_save();
 				break;
 
@@ -526,6 +527,19 @@ MainWindowProcedure(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 				device_force_redraw();
 				config_save();
 				break;
+
+#ifdef USE_DISCORD
+			case IDM_DISCORD:
+				if (! discord_loaded) break;
+				enable_discord ^= 1;
+				CheckMenuItem(hmenu, IDM_DISCORD, enable_discord ? MF_CHECKED : MF_UNCHECKED);
+				if(enable_discord) {
+					discord_init();
+					discord_update_activity(dopause);
+				} else
+					discord_close();
+				break;
+#endif
 
 #ifdef ENABLE_LOG_TOGGLES
 # ifdef ENABLE_BUSLOGIC_LOG
@@ -673,15 +687,6 @@ MainWindowProcedure(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 			ui_sb_timer_callback(wParam & 0xff);
 		break;
 		
-	case WM_RESETD3D:
-		startblit();
-		if (video_fullscreen)
-			d3d_reset_fs();
-		  else
-			d3d_reset();
-		endblit();
-		break;
-
 	case WM_LEAVEFULLSCREEN:
 		plat_setfullscreen(0);
 		config_save();
@@ -841,6 +846,18 @@ ui_init(int nCmdShow)
 	win_settings_open(NULL);
 	return(0);
     }
+
+#ifdef USE_DISCORD
+    if(! discord_load()) {
+	enable_discord = 0;
+    } else if (enable_discord) {
+	/* Initialize the Discord API */
+	discord_init();
+
+	/* Update Discord status */
+	discord_update_activity(dopause);
+    }
+#endif
 
     /* Create our main window's class and register it. */
     wincl.hInstance = hinstance;
@@ -1028,6 +1045,12 @@ ui_init(int nCmdShow)
 		/* Signal "exit fullscreen mode". */
 		plat_setfullscreen(0);
 	}
+
+#ifdef USE_DISCORD
+	/* Run Discord API callbacks */
+	if (enable_discord)
+		discord_run_callbacks();
+#endif
     }
 
     timeEndPeriod(1);
@@ -1042,6 +1065,11 @@ ui_init(int nCmdShow)
     UnregisterClass(CLASS_NAME, hinstance);
 
     win_mouse_close();
+
+#ifdef USE_DISCORD
+    /* Shut down the Discord integration */
+    discord_close();
+#endif
 
     return(messages.wParam);
 }
@@ -1100,6 +1128,12 @@ plat_pause(int p)
     /* Update the actual menu. */
     CheckMenuItem(menuMain, IDM_ACTION_PAUSE,
 		  (dopause) ? MF_CHECKED : MF_UNCHECKED);
+
+#if USE_DISCORD
+    /* Update Discord status */
+    if(enable_discord)
+	discord_update_activity(dopause);
+#endif
 
     /* Send the WM to a manager if needed. */
     if (source_hwnd)
